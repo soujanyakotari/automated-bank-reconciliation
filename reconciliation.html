@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Bank Reconciliation</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  :root{--bg:#f8fafc;--card:#fff;--ink:#0f172a;--muted:#64748b;--line:#e2e8f0;--accent:#2563eb;}
+  @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#0b1220;--card:#111a2b;--ink:#e6edf7;--muted:#93a3b8;--line:#22314a;--accent:#60a5fa;}}
+  :root[data-theme="dark"]{--bg:#0b1220;--card:#111a2b;--ink:#e6edf7;--muted:#93a3b8;--line:#22314a;--accent:#60a5fa;}
+  html,body{background:var(--bg);color:var(--ink);height:100%;}
+  body{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;}
+  table{width:100%;border-collapse:collapse;font-size:13px;}
+  th,td{padding:6px 10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap;}
+  th{color:var(--muted);font-weight:600;position:sticky;top:0;background:var(--card);}
+  .scrollx{overflow-x:auto;max-height:340px;overflow-y:auto;}
+  .tag{font-size:11px;padding:1px 8px;border-radius:999px;font-weight:600;}
+  .badge-exact{background:#dcfce7;color:#166534;}
+  .badge-fuzzy{background:#fef9c3;color:#854d0e;}
+  .badge-review{background:#fee2e2;color:#991b1b;}
+  @media (prefers-color-scheme: dark){.badge-exact{background:#14532d;color:#bbf7d0;}.badge-fuzzy{background:#4a3f0a;color:#fde68a;}.badge-review{background:#5f1d1d;color:#fecaca;}}
+</style>
+</head>
+<body class="min-h-screen">
+<div class="max-w-5xl mx-auto p-4 sm:p-6">
+  <h1 class="text-2xl font-bold mb-1">🏦 Automated Bank Reconciliation</h1>
+  <p class="text-sm mb-5" style="color:var(--muted)">Match a bank statement against your ledger — exact, fuzzy, and flagged-for-review passes, all in your browser.</p>
+
+  <div class="card p-4 mb-5">
+    <div class="grid sm:grid-cols-2 gap-4">
+      <div>
+        <label class="text-sm font-medium">Bank statement CSV</label>
+        <input id="bankFile" type="file" accept=".csv" class="block w-full text-sm mt-1"/>
+      </div>
+      <div>
+        <label class="text-sm font-medium">Company ledger CSV</label>
+        <input id="ledgerFile" type="file" accept=".csv" class="block w-full text-sm mt-1"/>
+      </div>
+    </div>
+    <p class="text-xs mt-2" style="color:var(--muted)">Expected columns (flexible naming): date, amount, reference, description.</p>
+    <div class="flex flex-wrap gap-2 mt-4">
+      <button id="runBtn" class="px-4 py-2 rounded-lg text-white text-sm font-medium" style="background:var(--accent)">Run Reconciliation</button>
+      <button id="sampleBtn" class="px-4 py-2 rounded-lg text-sm font-medium border" style="border-color:var(--line)">Try with sample data</button>
+    </div>
+  </div>
+
+  <div id="results" class="hidden">
+    <div id="summaryCard" class="card p-4 mb-5"></div>
+
+    <div class="card p-4 mb-5">
+      <div class="flex items-center justify-between mb-2">
+        <h2 class="font-semibold">Matched transactions <span id="matchedCount" class="text-xs" style="color:var(--muted)"></span></h2>
+        <button onclick="downloadCSV('matched')" class="text-xs px-3 py-1 rounded border" style="border-color:var(--line)">Export CSV</button>
+      </div>
+      <div class="scrollx"><table id="matchedTable"></table></div>
+    </div>
+
+    <div class="grid sm:grid-cols-2 gap-5">
+      <div class="card p-4">
+        <div class="flex items-center justify-between mb-2">
+          <h2 class="font-semibold text-sm">Bank only <span id="bankOnlyCount" class="text-xs" style="color:var(--muted)"></span></h2>
+          <button onclick="downloadCSV('bankOnly')" class="text-xs px-2 py-1 rounded border" style="border-color:var(--line)">Export</button>
+        </div>
+        <div class="scrollx"><table id="bankOnlyTable"></table></div>
+      </div>
+      <div class="card p-4">
+        <div class="flex items-center justify-between mb-2">
+          <h2 class="font-semibold text-sm">Ledger only <span id="ledgerOnlyCount" class="text-xs" style="color:var(--muted)"></span></h2>
+          <button onclick="downloadCSV('ledgerOnly')" class="text-xs px-2 py-1 rounded border" style="border-color:var(--line)">Export</button>
+        </div>
+        <div class="scrollx"><table id="ledgerOnlyTable"></table></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const ALIASES = {
+  date:['date','transaction_date','txn_date','posted_date','value_date'],
+  amount:['amount','amt','value','transaction_amount'],
+  reference:['reference','ref','ref_no','reference_number','check_number','cheque_no'],
+  description:['description','desc','memo','narrative','details']
+};
+const DATE_TOL_DAYS = 3, AMOUNT_TOL = 0.01, REF_SIM_THRESHOLD = 0.6;
+let state = { matched: [], bankOnly: [], ledgerOnly: [] };
+
+function norm(s){ return s.trim().toLowerCase().replace(/[\s_-]+/g,'_'); }
+function findCol(headers, aliases){
+  const map = {}; headers.forEach(h=>map[norm(h)]=h);
+  for(const a of aliases) if(map[a]) return map[a];
+  return null;
+}
+function parseCSV(text){
+  const lines = text.split(/\r?\n/).filter(l=>l.trim().length);
+  const headers = splitCSVLine(lines[0]);
+  return lines.slice(1).map(line=>{
+    const cells = splitCSVLine(line); const row={};
+    headers.forEach((h,i)=>row[h]=cells[i]??'');
+    return row;
+  });
+}
+function splitCSVLine(line){
+  const out=[]; let cur=''; let inQ=false;
+  for(let i=0;i<line.length;i++){
+    const c=line[i];
+    if(c==='"'){ inQ=!inQ; }
+    else if(c===',' && !inQ){ out.push(cur); cur=''; }
+    else cur+=c;
+  }
+  out.push(cur); return out.map(s=>s.trim());
+}
+function parseAmount(v){
+  let s = String(v).replace(/[\$,]/g,'').trim();
+  const paren = s.match(/^\((.*)\)$/); if(paren) s = '-'+paren[1];
+  return parseFloat(s);
+}
+function normalizeRows(rows, label){
+  if(!rows.length) return [];
+  const headers = Object.keys(rows[0]);
+  const dCol = findCol(headers, ALIASES.date), aCol = findCol(headers, ALIASES.amount);
+  const rCol = findCol(headers, ALIASES.reference), descCol = findCol(headers, ALIASES.description);
+  if(!dCol || !aCol) throw new Error(`[${label}] Missing date or amount column. Found: ${headers.join(', ')}`);
+  return rows.map((r,i)=>({
+    id: label+i,
+    date: new Date(r[dCol]),
+    amount: parseAmount(r[aCol]),
+    reference: (rCol? r[rCol]:'').toUpperCase(),
+    description: descCol? r[descCol]:''
+  })).filter(r=>!isNaN(r.date) && !isNaN(r.amount));
+}
+function similarity(a,b){
+  if(!a||!b) return 0;
+  a=a.toUpperCase(); b=b.toUpperCase();
+  if(a===b) return 1;
+  const setA=new Set(), setB=new Set();
+  for(let i=0;i<a.length-1;i++) setA.add(a.slice(i,i+2));
+  for(let i=0;i<b.length-1;i++) setB.add(b.slice(i,i+2));
+  let inter=0; setA.forEach(g=>{ if(setB.has(g)) inter++; });
+  return (2*inter)/((setA.size||1)+(setB.size||1));
+}
+function daysBetween(a,b){ return Math.abs((a-b)/86400000); }
+
+function reconcile(bank, ledger){
+  const usedB=new Set(), usedL=new Set(), matched=[];
+  // Pass A: exact
+  bank.forEach(b=>{
+    if(usedB.has(b.id)) return;
+    const l = ledger.find(l=>!usedL.has(l.id) && daysBetween(b.date,l.date)===0 &&
+      Math.abs(b.amount-l.amount)<=AMOUNT_TOL && b.reference && b.reference===l.reference);
+    if(l){ matched.push({b,l,type:'EXACT',conf:1}); usedB.add(b.id); usedL.add(l.id); }
+  });
+  // Pass B: fuzzy
+  bank.forEach(b=>{
+    if(usedB.has(b.id)) return;
+    let best=null, bestScore=-1;
+    ledger.forEach(l=>{
+      if(usedL.has(l.id)) return;
+      if(Math.abs(b.amount-l.amount)>AMOUNT_TOL) return;
+      if(daysBetween(b.date,l.date)>DATE_TOL_DAYS) return;
+      const sim = Math.max(similarity(b.reference,l.reference), similarity(b.description,l.description));
+      if(sim>bestScore){ bestScore=sim; best=l; }
+    });
+    if(best && bestScore>=REF_SIM_THRESHOLD){ matched.push({b,l:best,type:'FUZZY',conf:bestScore}); usedB.add(b.id); usedL.add(best.id); }
+  });
+  // Pass C: amount-only review
+  bank.forEach(b=>{
+    if(usedB.has(b.id)) return;
+    const l = ledger.find(l=>!usedL.has(l.id) && Math.abs(b.amount-l.amount)<=AMOUNT_TOL && daysBetween(b.date,l.date)<=DATE_TOL_DAYS);
+    if(l){ matched.push({b,l,type:'REVIEW',conf:0.4}); usedB.add(b.id); usedL.add(l.id); }
+  });
+  const bankOnly = bank.filter(b=>!usedB.has(b.id));
+  const ledgerOnly = ledger.filter(l=>!usedL.has(l.id));
+  return {matched, bankOnly, ledgerOnly};
+}
+
+function fmt(n){ return n.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}); }
+function dstr(d){ return d.toISOString().slice(0,10); }
+
+function renderResults(bank, ledger, r){
+  document.getElementById('results').classList.remove('hidden');
+  const nEx=r.matched.filter(m=>m.type==='EXACT').length, nFz=r.matched.filter(m=>m.type==='FUZZY').length, nRv=r.matched.filter(m=>m.type==='REVIEW').length;
+  const totalBank=bank.reduce((s,x)=>s+x.amount,0), totalLedger=ledger.reduce((s,x)=>s+x.amount,0);
+  document.getElementById('summaryCard').innerHTML = `
+    <h2 class="font-semibold mb-2">Summary</h2>
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm">
+      <div><div style="color:var(--muted)">Bank txns</div><div class="font-semibold">${bank.length}</div></div>
+      <div><div style="color:var(--muted)">Ledger txns</div><div class="font-semibold">${ledger.length}</div></div>
+      <div><div style="color:var(--muted)">Matched</div><div class="font-semibold">${r.matched.length} <span style="color:var(--muted)">(${nEx} exact, ${nFz} fuzzy, ${nRv} review)</span></div></div>
+      <div><div style="color:var(--muted)">Difference</div><div class="font-semibold">${fmt(totalBank-totalLedger)}</div></div>
+    </div>`;
+  document.getElementById('matchedCount').textContent = `(${r.matched.length})`;
+  document.getElementById('bankOnlyCount').textContent = `(${r.bankOnly.length})`;
+  document.getElementById('ledgerOnlyCount').textContent = `(${r.ledgerOnly.length})`;
+
+  const badge = t => t==='EXACT'?'badge-exact':t==='FUZZY'?'badge-fuzzy':'badge-review';
+  document.getElementById('matchedTable').innerHTML = `<tr><th>Type</th><th>Date (bank)</th><th>Amount</th><th>Reference</th><th>Description</th></tr>` +
+    r.matched.map(m=>`<tr><td><span class="tag ${badge(m.type)}">${m.type}</span></td><td>${dstr(m.b.date)}</td><td>${fmt(m.b.amount)}</td><td>${m.b.reference||m.l.reference}</td><td>${m.b.description}</td></tr>`).join('');
+  document.getElementById('bankOnlyTable').innerHTML = `<tr><th>Date</th><th>Amount</th><th>Ref</th></tr>` +
+    r.bankOnly.map(b=>`<tr><td>${dstr(b.date)}</td><td>${fmt(b.amount)}</td><td>${b.reference}</td></tr>`).join('');
+  document.getElementById('ledgerOnlyTable').innerHTML = `<tr><th>Date</th><th>Amount</th><th>Ref</th></tr>` +
+    r.ledgerOnly.map(l=>`<tr><td>${dstr(l.date)}</td><td>${fmt(l.amount)}</td><td>${l.reference}</td></tr>`).join('');
+
+  state.matched = r.matched.map(m=>({type:m.type,bank_date:dstr(m.b.date),bank_amount:m.b.amount,bank_reference:m.b.reference,ledger_date:dstr(m.l.date),ledger_amount:m.l.amount,ledger_reference:m.l.reference}));
+  state.bankOnly = r.bankOnly.map(b=>({date:dstr(b.date),amount:b.amount,reference:b.reference,description:b.description}));
+  state.ledgerOnly = r.ledgerOnly.map(l=>({date:dstr(l.date),amount:l.amount,reference:l.reference,description:l.description}));
+}
+
+function toCSV(rows){
+  if(!rows.length) return '';
+  const headers = Object.keys(rows[0]);
+  return [headers.join(','), ...rows.map(r=>headers.map(h=>`"${String(r[h]).replace(/"/g,'""')}"`).join(','))].join('\n');
+}
+async function downloadCSV(which){
+  const rows = state[which]; if(!rows.length){ alert('No rows to export.'); return; }
+  const csv = toCSV(rows);
+  const downloads = await claude.use('downloads').catch(()=>null);
+  if(downloads){ await downloads.save({filename: which+'.csv', data: csv}); }
+  else { const blob=new Blob([csv],{type:'text/csv'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=which+'.csv'; a.click(); }
+}
+
+function readFile(input){
+  return new Promise((res,rej)=>{
+    const f = input.files[0]; if(!f){ rej('No file'); return; }
+    const fr = new FileReader(); fr.onload=()=>res(fr.result); fr.onerror=rej; fr.readAsText(f);
+  });
+}
+
+document.getElementById('runBtn').onclick = async ()=>{
+  try{
+    const bankText = await readFile(document.getElementById('bankFile'));
+    const ledgerText = await readFile(document.getElementById('ledgerFile'));
+    const bank = normalizeRows(parseCSV(bankText),'BANK');
+    const ledger = normalizeRows(parseCSV(ledgerText),'LEDGER');
+    renderResults(bank, ledger, reconcile(bank, ledger));
+  }catch(e){ alert('Error: '+(e.message||e)); }
+};
+
+function generateSample(){
+  const vendors=['Acme Supplies','Globex Corp','Initech Payroll','Umbrella Utilities','Stark Rent','Wayne Insurance'];
+  const start = new Date('2026-08-01'); const ledger=[], bank=[];
+  for(let i=0;i<40;i++){
+    const d = new Date(start.getTime()+Math.floor(Math.random()*45)*86400000);
+    const amt = (Math.random()<0.5?-1:1)*Math.round((50+Math.random()*4950)*100)/100;
+    const vendor = vendors[Math.floor(Math.random()*vendors.length)];
+    const ref = `TXN${1000+i}`;
+    ledger.push({date:d.toISOString().slice(0,10),amount:amt,reference:ref,description:vendor});
+  }
+  ledger.forEach(l=>{
+    const roll = Math.random();
+    if(roll<0.7){
+      const d = new Date(new Date(l.date).getTime()+Math.floor(Math.random()*3)*86400000);
+      bank.push({date:d.toISOString().slice(0,10),amount:l.amount,reference:l.reference,description:l.description});
+    } else if(roll<0.85){
+      const d = new Date(new Date(l.date).getTime()+Math.floor(Math.random()*3)*86400000);
+      bank.push({date:d.toISOString().slice(0,10),amount:l.amount,reference:l.reference.toLowerCase().replace('txn','TXN-'),description:l.description+' ACH'});
+    }
+  });
+  for(let j=0;j<4;j++){
+    const d = new Date(start.getTime()+Math.floor(Math.random()*45)*86400000);
+    bank.push({date:d.toISOString().slice(0,10),amount:-Math.round((5+Math.random()*45)*100)/100,reference:`FEE${j}`,description:'Bank Service Fee'});
+  }
+  return {bank: normalizeRows(bank,'BANK'), ledger: normalizeRows(ledger,'LEDGER')};
+}
+document.getElementById('sampleBtn').onclick = ()=>{
+  const {bank, ledger} = generateSample();
+  renderResults(bank, ledger, reconcile(bank, ledger));
+};
+</script>
+</body>
+</html>
